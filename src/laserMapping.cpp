@@ -99,6 +99,12 @@ bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool    is_first_lidar = true;
 
+bool   publish_tf = true;
+string odom_frame = "camera_init";
+string lidar_frame = "body";
+vector<double> lidar_pos(3, 0.0);
+vector<double> lidar_rot(4, 0.0);
+
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
 vector<PointVector>  Nearest_Points; 
@@ -505,7 +511,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
         // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
         laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-        laserCloudmsg.header.frame_id = "camera_init";
+        laserCloudmsg.header.frame_id = odom_frame;
         pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
     }
@@ -557,7 +563,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
+    laserCloudmsg.header.frame_id = lidar_frame;
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -574,7 +580,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
     laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = "camera_init";
+    laserCloudFullRes3.header.frame_id = odom_frame;
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
@@ -596,7 +602,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
+    laserCloudmsg.header.frame_id = odom_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
 
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
@@ -611,6 +617,42 @@ void save_to_pcd()
     pcl::PCDWriter pcd_writer;
     pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
 }
+
+void transform_pose(geometry_msgs::msg::Pose& in, const std::vector<double>& pos_offset, const std::vector<double>& rot_offset)
+{
+    Eigen::Vector3d pos_in(in.position.x, in.position.y, in.position.z);
+    Eigen::Quaterniond quat_in(
+        in.orientation.w,
+        in.orientation.x,
+        in.orientation.y,
+        in.orientation.z
+    );
+
+    Eigen::Quaterniond quat_offset(
+        rot_offset[3], // note order: w, x, y, z for Eigen ctor
+        rot_offset[0],
+        rot_offset[1],
+        rot_offset[2]
+    );
+    Eigen::Vector3d t_offset(pos_offset[0], pos_offset[1], pos_offset[2]);
+
+    Eigen::Quaterniond quat_inv = quat_offset.conjugate();
+    Eigen::Vector3d t_inv = -(quat_inv * t_offset);
+
+    // T(world->base) = T(world->lidar) * T(lidar->base)
+    Eigen::Quaterniond quat_out = quat_in * quat_inv;
+    quat_out.normalize();
+    Eigen::Vector3d pos_out = pos_in + quat_in * t_inv;
+
+    in.position.x = pos_out.x();
+    in.position.y = pos_out.y();
+    in.position.z = pos_out.z();
+    in.orientation.w = quat_out.w();
+    in.orientation.x = quat_out.x();
+    in.orientation.y = quat_out.y();
+    in.orientation.z = quat_out.z();
+}
+
 
 template<typename T>
 void set_posestamp(T & out)
@@ -627,10 +669,11 @@ void set_posestamp(T & out)
 
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
+    odomAftMapped.header.frame_id = odom_frame;
+    odomAftMapped.child_frame_id = lidar_frame;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
+    transform_pose(odomAftMapped.pose.pose, lidar_pos, lidar_rot);
     pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
@@ -644,10 +687,12 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
+    if (!publish_tf) return;
+
     geometry_msgs::msg::TransformStamped trans;
-    trans.header.frame_id = "camera_init";
+    trans.header.frame_id = odom_frame;
     trans.header.stamp = odomAftMapped.header.stamp;
-    trans.child_frame_id = "body";
+    trans.child_frame_id = lidar_frame;
     trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
     trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
     trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
@@ -662,7 +707,7 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
     set_posestamp(msg_body_pose);
     msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = "camera_init";
+    msg_body_pose.header.frame_id = odom_frame;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
@@ -810,6 +855,11 @@ public:
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
+        this->declare_parameter<bool>("common.publish_tf", true);
+        this->declare_parameter<string>("common.odom_frame", "camera_init");
+        this->declare_parameter<string>("common.lidar_frame", "body");
+        this->declare_parameter<vector<double>>("common.lidar_pose", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("common.lidar_rot", vector<double>{0.0, 0.0, 0.0, 0.0});
         this->declare_parameter<double>("filter_size_corner", 0.5);
         this->declare_parameter<double>("filter_size_surf", 0.5);
         this->declare_parameter<double>("filter_size_map", 0.5);
@@ -846,6 +896,11 @@ public:
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
+        this->get_parameter_or<bool>("common.publish_tf", publish_tf, true);
+        this->get_parameter_or<string>("common.odom_frame", odom_frame, "camera_init");
+        this->get_parameter_or<string>("common.lidar_frame", lidar_frame, "body");
+        this->get_parameter_or<vector<double>>("common.lidar_pose", lidar_pos, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("common.lidar_rot", lidar_rot, vector<double>{0.0, 0.0, 0.0, 0.0});
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
         this->get_parameter_or<double>("filter_size_surf",filter_size_surf_min,0.5);
         this->get_parameter_or<double>("filter_size_map",filter_size_map_min,0.5);
@@ -873,7 +928,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
         path.header.stamp = this->get_clock()->now();
-        path.header.frame_id ="camera_init";
+        path.header.frame_id = odom_frame;
 
         // /*** variables definition ***/
         // int effect_feat_num = 0, frame_num = 0;
@@ -982,7 +1037,7 @@ private:
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
-                RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                RCLCPP_DEBUG(this->get_logger(), "No point, skip this scan!\n");
                 return;
             }
 
@@ -1020,7 +1075,7 @@ private:
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
             {
-                RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                RCLCPP_DEBUG(this->get_logger(), "No point, skip this scan!\n");
                 return;
             }
             
