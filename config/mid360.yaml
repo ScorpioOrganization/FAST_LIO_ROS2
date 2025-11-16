@@ -10,6 +10,11 @@
         map_file_path: "./test.pcd"
 
         common:
+            publish_tf: true                   # publish TF between odom_frame and base_frame
+            odom_frame: "camera_init"          # Frame in relation to which the odometry is published
+            lidar_frame: "body"                # Frame of the LiDAR
+            lidar_pose: [ 0.0, 0.0, 0.0 ]      # Lidar to base_frame position translation
+            lidar_rot:  [ 0.0, 0.0, 0.0, 1.0 ] # Lidar to base_frame rotation translation (quaternion x,y,z,w)
             lid_topic:  "/livox/lidar"
             imu_topic:  "/livox/imu"
             time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
